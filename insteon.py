@@ -16,7 +16,7 @@ import asyncio
 import definitions
 import aiohttp
 import base64
-from collections import defaultdict
+from collections import defaultdict, Counter
 import xml.etree.ElementTree as et
 import urllib.request
 import socket
@@ -36,6 +36,7 @@ class insteonCatalog():
         self.log=log
         self.basicauth="Basic %s" % base64.encodebytes(("%s:%s" % (self.username,self.password)).encode('utf-8')).decode()
         self.sema = asyncio.Semaphore(5)
+        self.skip_nodetype=['root','folder']
         
     def etree_to_dict(self, t):
         
@@ -168,7 +169,10 @@ class insteonCatalog():
 
             try:
                 for nodetype in nodesJSON['nodes']:
+                    if nodetype in self.skip_nodetype:
+                        continue
                     if nodetype not in self.dataset.nativeDevices:
+                        self.log.info('prebake: %s before %s' % (nodetype,nodesJSON['nodes'][nodetype]))
                         self.dataset.nativeDevices[nodetype]={} # helps make sure the first added item uses the same format as subsequent
                     try:
                         for item in nodesJSON['nodes'][nodetype]:
@@ -194,7 +198,6 @@ class insteonCatalog():
 
                             except:
                                 self.log.error('couldnt get property or find device type for: %s / %s' % (item['address'],item['type']), exc_info=True)
-                            
                             await self.dataset.ingest({ nodetype: { item['address']:  item }})
                     except TypeError:
                         self.log.warn('No data in node type: %s' % nodetype)
@@ -468,11 +471,12 @@ class insteonSubscription(asyncio.Protocol):
                         self.log.error('Error comparing previous state', exc_info=True)
                     #self.log.info('Property event: %s %s' % (event['node'],event))
                     #self.log.info('Existing data: %s %s' % (event['node'], self.dataset.nativeDevices['node'][event['node']]))
-                    self.log.info('pending %s' % self.pendingChanges)
+                    if self.pendingChanges:
+                        self.log.info('pending %s' % self.pendingChanges)
                     if event['node'] not in self.pendingChanges:
                         # testing allowing the _1 update to provide the update when the change was requested by the UI
                         updatedProperties=await self.getNodeProperties(event['node'])
-                        self.log.info('event UpdatedProperties: %s not in pending %s - %s' % (event['node'], self.pendingChanges, updatedProperties))
+                        #self.log.info('event UpdatedProperties: %s not in pending %s - %s' % (event['node'], self.pendingChanges, updatedProperties))
                         changeReport=await self.dataset.ingest({'node': { event['node']: {'property':updatedProperties}}})
                         if changeReport:
                             self.log.info('event changereport: %s' % changeReport)
@@ -596,7 +600,10 @@ class insteonSetter():
                 
             for nodeattrib in data:
                 if nodeattrib.upper() in ['DON','DOF','DFON', 'DFOF']:
-                    url="http://%s/rest/nodes/%s/%s/%s" % (self.insteonAddress, node, "cmd", nodeattrib)
+                    if nodeattrib.upper() in ['DON', 'DFON'] and data[nodeattrib]:
+                        url="http://%s/rest/nodes/%s/%s/%s/%s" % (self.insteonAddress, node, "cmd", nodeattrib, data[nodeattrib])
+                    else:
+                        url="http://%s/rest/nodes/%s/%s/%s" % (self.insteonAddress, node, "cmd", nodeattrib)
                 elif nodeattrib.upper()=='ST':
                     if int(data[nodeattrib])==0:
                         control='DOF'
@@ -669,7 +676,10 @@ class insteon(sofabase):
 
         async def TurnOn(self, correlationToken='', **kwargs):
             try:
-                return await self.adapter.setAndUpdate(self.device, {'DON': 100}, "powerState", "ON", correlationToken, self)
+                tol=100
+                if int((float(self.nativeObject['property']['ST']['value'])/254)*100)>0:
+                    tol=int((float(self.nativeObject['property']['ST']['value'])/254)*100)
+                return await self.adapter.setAndUpdate(self.device, {'DON': tol}, "powerState", "ON", correlationToken, self)
             except:
                 self.adapter.log.error('!! Error during TurnOn', exc_info=True)
         
@@ -772,6 +782,37 @@ class insteon(sofabase):
             except:
                 self.adapter.log.error('!! Error setting thermostat mode', exc_info=True)
 
+    class GroupPowerController(devices.PowerController):
+
+        @property            
+        def powerState(self):
+            return None
+            
+        async def TurnOn(self, correlationToken='', **kwargs):
+            try:
+                return await self.adapter.setAndUpdate(self.device, {'DON': ''}, "powerState", "ON", correlationToken, self)
+            except:
+                self.adapter.log.error('!! Error during TurnOn', exc_info=True)
+        
+        async def TurnOff(self, correlationToken='', **kwargs):
+            try:
+                return await self.adapter.setAndUpdate(self.device, {'DOF': 0}, "powerState", "OFF", correlationToken, self)
+            except:
+                self.adapter.log.error('!! Error during TurnOff', exc_info=True)
+                
+    class GroupBrightnessController(devices.BrightnessController):
+
+        @property            
+        def brightness(self):
+            return None
+        
+        async def SetBrightness(self, payload, correlationToken='', **kwargs):
+            try:
+                return await self.adapter.setAndUpdate(self.device, {'ST' : self.adapter.percentage(int(payload['brightness']), 255) }, "brightness", payload['brightness'], correlationToken, self)
+            except:
+                self.adapter.log.error('!! Error setting brightness', exc_info=True)
+
+
 
     class adapterProcess(adapterbase):
 
@@ -809,50 +850,59 @@ class insteon(sofabase):
             return int((percent * whole) / 100.0)
 
 
+
         async def addSmartDevice(self, path):
             
-            # All Insteon Smart Devices will be nodes
-            if path.split("/")[1]!='node':
+            # All Insteon Smart Devices will be nodes except groups
+            if path.split("/")[1]!='node' and path.split("/")[1]!='group':
                 return False
             
             deviceid=path.split("/")[2]    
             nativeObject=self.dataset.getObjectFromPath(self.dataset.getObjectPath(path))
 
             if nativeObject['name'] not in self.dataset.localDevices:
-                if nativeObject["devicetype"]=="light":
-                    device=devices.alexaDevice('insteon/node/%s' % deviceid, nativeObject['name'], displayCategories=['LIGHT'], adapter=self)
-                    device.PowerController=insteon.PowerController(device=device)
-                    device.EndpointHealth=insteon.EndpointHealth(device=device)
-                    device.StateController=devices.StateController(device=device)
-                    if nativeObject["property"]["ST"]["uom"].find("%")>-1:
-                        device.BrightnessController=insteon.BrightnessController(device=device)
-                    return self.dataset.newaddDevice(device)
-
-                elif nativeObject["devicetype"]=="lightswitch":
-                    device=devices.alexaDevice('insteon/node/%s' % deviceid, nativeObject['name'], displayCategories=['LIGHT'], adapter=self)
-                    device.PowerController=insteon.PowerController(device=device)
-                    device.EndpointHealth=insteon.EndpointHealth(device=device)
-                    device.StateController=devices.StateController(device=device)
-                    device.SwitchController=insteon.SwitchController(device=device)
-                    if nativeObject["property"]["ST"]["uom"].find("%")>-1:
-                        device.BrightnessController=insteon.BrightnessController(device=device)
-                    return self.dataset.newaddDevice(device)
-
-                elif nativeObject["devicetype"]=="button":
-                    device=devices.alexaDevice('insteon/node/%s' % deviceid, nativeObject['name'], displayCategories=['SWITCH'], adapter=self)
-                    device.SwitchController=insteon.SwitchController(device=device)
-                    return self.dataset.newaddDevice(device)
-
-                elif nativeObject["devicetype"]=="thermostat":
-                    if nativeObject['pnode']==deviceid:
-                        device=devices.alexaDevice('insteon/node/%s' % deviceid, nativeObject['name'], displayCategories=['THERMOSTAT'], adapter=self)
-                        device.ThermostatController=insteon.ThermostatController(device=device)
-                        device.TemperatureSensor=insteon.TemperatureSensor(device=device)
+                if 'devicetype' in nativeObject:
+                    if nativeObject["devicetype"]=="light":
+                        device=devices.alexaDevice('insteon/node/%s' % deviceid, nativeObject['name'], displayCategories=['LIGHT'], adapter=self)
+                        device.PowerController=insteon.PowerController(device=device)
+                        device.EndpointHealth=insteon.EndpointHealth(device=device)
+                        device.StateController=devices.StateController(device=device)
+                        if nativeObject["property"]["ST"]["uom"].find("%")>-1:
+                            device.BrightnessController=insteon.BrightnessController(device=device)
                         return self.dataset.newaddDevice(device)
-
-                elif nativeObject["devicetype"]=="device":
-                    device=devices.alexaDevice('insteon/node/%s' % deviceid, nativeObject['name'], displayCategories=['SWITCH'], adapter=self)
-                    device.PowerController=insteon.PowerController(device=device)
+    
+                    elif nativeObject["devicetype"]=="lightswitch":
+                        device=devices.alexaDevice('insteon/node/%s' % deviceid, nativeObject['name'], displayCategories=['LIGHT'], adapter=self)
+                        device.PowerController=insteon.PowerController(device=device)
+                        device.EndpointHealth=insteon.EndpointHealth(device=device)
+                        device.StateController=devices.StateController(device=device)
+                        device.SwitchController=insteon.SwitchController(device=device)
+                        if nativeObject["property"]["ST"]["uom"].find("%")>-1:
+                            device.BrightnessController=insteon.BrightnessController(device=device)
+                        return self.dataset.newaddDevice(device)
+    
+                    elif nativeObject["devicetype"]=="button":
+                        device=devices.alexaDevice('insteon/node/%s' % deviceid, nativeObject['name'], displayCategories=['SWITCH'], adapter=self)
+                        device.SwitchController=insteon.SwitchController(device=device)
+                        return self.dataset.newaddDevice(device)
+    
+                    elif nativeObject["devicetype"]=="thermostat":
+                        if nativeObject['pnode']==deviceid:
+                            device=devices.alexaDevice('insteon/node/%s' % deviceid, nativeObject['name'], displayCategories=['THERMOSTAT'], adapter=self)
+                            device.ThermostatController=insteon.ThermostatController(device=device)
+                            device.TemperatureSensor=insteon.TemperatureSensor(device=device)
+                            return self.dataset.newaddDevice(device)
+    
+                    elif nativeObject["devicetype"]=="device":
+                        device=devices.alexaDevice('insteon/node/%s' % deviceid, nativeObject['name'], displayCategories=['SWITCH'], adapter=self)
+                        device.PowerController=insteon.PowerController(device=device)
+                        return self.dataset.newaddDevice(device)
+                    
+                elif 'deviceGroup' in nativeObject:
+                    device=devices.alexaDevice('insteon/group/%s' % deviceid, nativeObject['name'], displayCategories=['GROUP'], adapter=self, hidden=True)
+                    device.EndpointHealth=insteon.EndpointHealth(device=device)    
+                    device.PowerController=insteon.GroupPowerController(device=device)
+                    #device.BrightnessController=insteon.GroupBrightnessController(device=device)
                     return self.dataset.newaddDevice(device)
                     
             return False
@@ -874,11 +924,20 @@ class insteon(sofabase):
                     self.log.info('Assuming success on response. pre-setting %s to %s' % (controllerprop, controllervalue) )
                     #await self.dataset.ingest({'node': { deviceid: {'property':updatedProperties}}})
                     #return device.Response(correlationToken)  
-                self.log.info('Comparing %s vs %s' % (getattr(controller, controllerprop),controllervalue))
-                if getattr(controller, controllerprop)!=controllervalue:
-                    await self.waitPendingChange(deviceid)
+                if device.endpointId.startswith('insteon:group:'):
+                    groupmembers=await self.group_members(device.endpointId)
+                    for member in groupmembers:
+                        self.log.info('.. adding group member to pending: %s' % member)
+                        await self.waitPendingChange(member)                        
+                if not device.endpointId.startswith('insteon:group:'):
+                    self.log.info('Comparing %s vs %s' % (getattr(controller, controllerprop),controllervalue))
+                    if getattr(controller, controllerprop)!=controllervalue:
+                        await self.waitPendingChange(deviceid)
                 updatedProperties=await self.insteonNodes.getNodeProperties(deviceid)
-                await self.dataset.ingest({'node': { deviceid: {'property':updatedProperties}}})
+                if not device.endpointId.startswith('insteon:group:'):
+                    await self.dataset.ingest({'node': { deviceid: {'property':updatedProperties}}})
+                else:
+                    await self.dataset.ingest({'group': { deviceid: {'property':updatedProperties}}})
                 return device.Response(correlationToken)
             except:
                 self.log.error('!! Error during Set and Update: %s %s / %s %s' % (deviceid, command, controllerprop, controllervalue), exc_info=True)
@@ -905,7 +964,37 @@ class insteon(sofabase):
                 self.log.error('Error during wait for pending change for %s (%s)' % (deviceid, count), exc_info=True)
                 return True
                 
-
+        async def group_members(self, endpointId):
+            try:
+                groupmembers=[]
+                self.log.info('.. getting group members for %s' % endpointId)
+                for link in self.dataset.nativeDevices['group'][endpointId.split(':',2)[2]]['members']['link']:
+                    groupmembers.append('insteon:node:%s' % link['#text'])
+            except:
+                self.log.error('!! error trying to get virtual group members: %s' % group_id, exc_info=True)
+            return groupmembers 
+               
+        async def virtual_group_handler(self, controllers, devicelist):
+            try:
+                for group in self.dataset.nativeDevices['group']:
+                    dev=self.dataset.getDeviceByEndpointId("insteon:group:%s" % group)
+                    if dev:
+                        all_controllers=True
+                        for controller in controllers:
+                            if not hasattr(dev, controller):
+                                all_controllers=False
+                        
+                        if all_controllers:
+                            groupmembers=await self.group_members("insteon:group:%s" % group)
+                            if Counter(devicelist) == Counter(groupmembers):  
+                                return { "id": "insteon:group:%s" % group, "name": self.dataset.nativeDevices['group'][group]['name'] }
+                            
+                #self.log.info('.. no virtual group found for %s' % devicelist)
+            except:
+                self.log.error('!! error trying to get virtual group: %s' % devicelist, exc_info=True)
+                
+            return {}
+            
 if __name__ == '__main__':
     adapter=insteon(name="insteon")
     adapter.start()

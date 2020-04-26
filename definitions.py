@@ -71,7 +71,7 @@ class Definitions():
                     "1.6.51.0":"light",
                     "1.14.58.0":"light",
                     "1.14.65.0":"light",
-                    "1.25.56.0":"light",
+                    "1.25.56.0":"lightswitch",
                     "1.25.64.0":"lightswitch",
                     "1.28.57.0":"light",
                     "1.32.64.0":"light",
