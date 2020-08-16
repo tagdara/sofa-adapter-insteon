@@ -5,7 +5,7 @@ import sys, os
 sys.path.append(os.path.dirname(__file__))
 sys.path.append(os.path.join(os.path.dirname(__file__),'../../base'))
 
-from sofabase import sofabase,adapterbase
+from sofabase import sofabase, adapterbase, configbase
 import devices
 
 import math
@@ -20,21 +20,16 @@ from collections import defaultdict, Counter
 import xml.etree.ElementTree as et
 import urllib.request
 import socket
-
-#import deepdiff
-#from deepdiff import DeepDiff
+import datetime
 
 class insteonCatalog():
     
-    def __init__(self, log=None, dataset=None):
+    def __init__(self, log=None, dataset=None, config=None):
+        self.config=config
         self.dataset=dataset
         self.definitions=definitions.Definitions
-        self.insteonAddress=self.dataset.config['address']
-        self.port=self.dataset.config['port']
-        self.username=self.dataset.config['user']
-        self.password=self.dataset.config['password']
         self.log=log
-        self.basicauth="Basic %s" % base64.encodebytes(("%s:%s" % (self.username,self.password)).encode('utf-8')).decode()
+        self.basicauth="Basic %s" % base64.encodebytes(("%s:%s" % (self.config.isy_user,self.config.isy_password)).encode('utf-8')).decode()
         self.sema = asyncio.Semaphore(5)
         self.skip_nodetype=['root','folder']
         
@@ -61,9 +56,9 @@ class insteonCatalog():
 
     async def authenticate(self):
         async with aiohttp.ClientSession() as client:
-            self.payload='<s:Envelope><s:Body><u:Authenticate xmlns:u="urn:udi-com:service:X_Insteon_Lighting_Service:1"><name>%s</name><id>%s</id></u:Authenticate></s:Body></s:Envelope>\r\n' % (self.username, self.password)
+            self.payload='<s:Envelope><s:Body><u:Authenticate xmlns:u="urn:udi-com:service:X_Insteon_Lighting_Service:1"><name>%s</name><id>%s</id></u:Authenticate></s:Body></s:Envelope>\r\n' % (self.config.isy_user, self.config.isy_password)
 
-            url = 'http://%s' % self.insteonAddress
+            url = 'http://%s' % self.config.isy_address
             headers = { "Authorization": self.basicauth, 
                         "SOAPACTION": '"urn:udi-com:service:X_Insteon_Lighting_Service:1#Authenticate"'}
 
@@ -75,7 +70,7 @@ class insteonCatalog():
         try:
             self.log.info("GetNodesConfig Obtaining list of insteon nodes")
             self.nodesmaster={}
-            url = "http://%s/rest/nodes/" % self.insteonAddress
+            url = "http://%s/rest/nodes/" % self.config.isy_address
             headers = { "Authorization": self.basicauth }
             data = await client.get(url, headers=headers)
             html = await data.read() 
@@ -143,7 +138,7 @@ class insteonCatalog():
 
     async def getNodeProperties(self, address):
 
-        url="http://%s/rest/nodes/%s" % (self.insteonAddress, urllib.request.quote(address))
+        url="http://%s/rest/nodes/%s" % (self.config.isy_address, urllib.request.quote(address))
         headers = { "Authorization": self.basicauth }
         async with aiohttp.ClientSession() as client:
             async with self.sema, client.get(url, headers=headers) as data:
@@ -172,7 +167,7 @@ class insteonCatalog():
                     if nodetype in self.skip_nodetype:
                         continue
                     if nodetype not in self.dataset.nativeDevices:
-                        self.log.info('prebake: %s before %s' % (nodetype,nodesJSON['nodes'][nodetype]))
+                        #self.log.info('prebake: %s before %s' % (nodetype,nodesJSON['nodes'][nodetype]))
                         self.dataset.nativeDevices[nodetype]={} # helps make sure the first added item uses the same format as subsequent
                     try:
                         for item in nodesJSON['nodes'][nodetype]:
@@ -183,9 +178,9 @@ class insteonCatalog():
                                         continue
                                 if 'property' in item:
                                     item['property']=await self.getNodeProperties(item['address']) # Replace subset of property with complete set
-                                    if item['address'] in self.dataset.config['device_override']:
-                                        item['devicetype']=self.dataset.config['device_override'][item['address']]
-                                        self.log.info('Device type manually set for %s: %s' % (item['address'],item['devicetype']))
+                                    if item['address'] in self.dataset.config.device_override:
+                                        item['devicetype']=self.dataset.config.device_override[item['address']]
+                                        self.log.info('.. Device type manually set for %s: %s' % (item['address'],item['devicetype']))
                                     else:
                                         item['devicetype']=self.definitions.deviceTypes[item['type']]
 
@@ -211,7 +206,8 @@ class insteonCatalog():
 
 class insteonSubscription(asyncio.Protocol):
 
-    def __init__(self, loop, log=None, notify=None, dataset=None, **kwargs):
+    def __init__(self, loop, log=None, notify=None, dataset=None, config=None, **kwargs):
+        self.config=config
         self.dataset=dataset
         self.is_open = False
         self.loop = loop
@@ -220,16 +216,13 @@ class insteonSubscription(asyncio.Protocol):
         self.definitions=definitions.Definitions
         self.sendQueue=[]
         self.notify=notify
-        self.insteonAddress=self.dataset.config['address']
-        self.port=self.dataset.config['port']
-        self.username=self.dataset.config['user']
-        self.password=self.dataset.config['password']
         self.eventdata=''
         self.logbusy=False
         self.catalog=insteonCatalog
         self.controllerBusy=False
-        self.basicauth="Basic %s" % base64.encodebytes(("%s:%s" % (self.username,self.password)).encode('utf-8')).decode()
+        self.basicauth="Basic %s" % base64.encodebytes(("%s:%s" % (self.config.isy_user,self.config.isy_password)).encode('utf-8')).decode()
         self.pendingChanges=[]
+        self.pending_data={}
 
     def etree_to_dict(self, t):
         
@@ -256,7 +249,7 @@ class insteonSubscription(asyncio.Protocol):
     async def getNodeProperties(self, address):
 
         try:
-            url="http://%s/rest/nodes/%s" % (self.insteonAddress, urllib.request.quote(address))
+            url="http://%s/rest/nodes/%s" % (self.config.isy_address, urllib.request.quote(address))
             headers = { "Authorization": self.basicauth }
             async with aiohttp.ClientSession() as client:
                 async with self.sema, client.get(url, headers=headers) as data:
@@ -280,12 +273,12 @@ class insteonSubscription(asyncio.Protocol):
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            sock.connect((self.insteonAddress,self.port))
+            sock.connect((self.config.isy_address, self.config.isy_port))
             sock.settimeout(10.0)
 
             logstr="<s:Envelope><s:Body><u:SetDebugLevel><option>"+level+"</option></u:SetDebugLevel></s:Body></s:Envelope>"
             loghead="POST /services HTTP/1.1\r\n"
-            loghead+="Host: %s:%u\r\n" % (self.insteonAddress,self.port)
+            loghead+="Host: %s:%u\r\n" % (self.config.isy_address, self.config.isy_port)
             loghead+="Content-Length: %u\r\n" % len(logstr)
             loghead+="Content-Type: text/xml; charset=\"utf-8\"\r\n"	
             loghead+="Authorization: "+ self.basicauth
@@ -321,11 +314,11 @@ class insteonSubscription(asyncio.Protocol):
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            sock.connect((self.insteonAddress,self.port))
+            sock.connect((self.config.isy_address,self.config.isy_port))
             sock.settimeout(10.0)
             logstr="<s:Envelope><s:Body><u:GetDebugLevel /></s:Body></s:Envelope>"
             loghead="POST /services HTTP/1.1\r\n"
-            loghead+="Host: %s:%u\r\n" % (self.insteonAddress,self.port)
+            loghead+="Host: %s:%u\r\n" % (self.config.isy_address,self.config.isy_port)
             loghead+="Content-Length: %u\r\n" % len(logstr)
             loghead+="Content-Type: text/xml; charset=\"utf-8\"\r\n"	
             loghead+="Authorization: "+ self.basicauth
@@ -343,15 +336,17 @@ class insteonSubscription(asyncio.Protocol):
                 self.log.error('.! Error getting debug level', exc_info=True)
                 level=0
             return level
+        except xml.etree.ElementTree.ParseError:
+            self.log.error('!! Error getting ISY debug level - bad data in response: %s' % answer)
         except:
-            self.log.error('Error setting ISY debug level',exc_info=True)
-            return False        
+            self.log.error('!! Error getting ISY debug level',exc_info=True)
+        return False        
                
     def sendSubscribeRequest(self, transport):
         try:
             subscribestr="<s:Envelope><s:Body><u:Subscribe xmlns:u=\"urn:udi-com:service:X_Insteon_Lighting_Service:1\"></u:Subscribe></s:Body></s:Envelope>"
             connecthead="SUBSCRIBE /eventing HTTP/1.1\r\n"
-            connecthead+="Host: %s:%u\r\n" % (self.insteonAddress,self.port)
+            connecthead+="Host: %s:%u\r\n" % (self.config.isy_address, self.config.isy_port)
             connecthead+="Content-Length: %u\r\nContent-Type: text/xml; charset=\"utf-8\"\r\n" % len(subscribestr)
             connecthead+="CALLBACK:<REUSE_SOCKET>\r\nNT:upnp:event\r\nTIMEOUT:Second-infinite\r\n"
             connecthead+="Authorization: %s" % self.basicauth
@@ -472,16 +467,23 @@ class insteonSubscription(asyncio.Protocol):
                     #self.log.info('Property event: %s %s' % (event['node'],event))
                     #self.log.info('Existing data: %s %s' % (event['node'], self.dataset.nativeDevices['node'][event['node']]))
                     if self.pendingChanges:
-                        self.log.info('pending %s' % self.pendingChanges)
-                    if event['node'] not in self.pendingChanges:
+                        self.log.info('.. pending %s' % self.pendingChanges)
+                        
+                    # TODO/Cheese - this causes a bunch of problems when combined with handling groups
+                    # I'm temporarily removing the pending changes check to see what happens but this is probably
+                    # needed for other things
+                    
+                    #if event['node'] not in self.pendingChanges:
+                    if 1==1:
                         # testing allowing the _1 update to provide the update when the change was requested by the UI
                         updatedProperties=await self.getNodeProperties(event['node'])
                         #self.log.info('event UpdatedProperties: %s not in pending %s - %s' % (event['node'], self.pendingChanges, updatedProperties))
                         changeReport=await self.dataset.ingest({'node': { event['node']: {'property':updatedProperties}}})
                         if changeReport:
-                            self.log.info('event changereport: %s' % changeReport)
+                            self.log.debug('event changereport: %s' % changeReport)
                     else:
                         updatedProperties=await self.getNodeProperties(event['node'])
+                        self.pending_data[event['node']]=updatedProperties
                         self.log.info('Update processing deferred to change: %s %s' %  (updatedProperties, self.dataset.nativeDevices['node'][event['node']]))
 
                 except TimeoutError:
@@ -531,7 +533,7 @@ class insteonSubscription(asyncio.Protocol):
                 if vEvent['node'].find('VAR')>-1:
                     vEvent['var']=vEvent['node'].split()[1]
                     vEvent['val']=vEvent['node'].split()[2]
-                    self.log.info("insteon Variable %s set to %s" % (vEvent['var'], vEvent['val']))
+                    self.log.info(".. insteon Variable %s set to %s" % (vEvent['var'], vEvent['val']))
                 elif vEvent['node']=="Time":
                     self.log.debug("Time info: %s %s" % (vEvent['node'], event['eventInfo']))
                 else:
@@ -554,10 +556,10 @@ class insteonSubscription(asyncio.Protocol):
         try:
             if self.definitions.nodeChanges[event['action']]=="Node Error (Comm. Errors)":
                 if self.dataset.nativeDevices['node'][event['node']]['type'] in self.definitions.wirelessDeviceTypes:
-                    self.log.debug('Node Changed > %s (wireless) > %s' % (self.definitions.nodeChanges[event['action']], event['node']))
+                    self.log.debug('.. Node Changed > %s (wireless) > %s' % (self.definitions.nodeChanges[event['action']], event['node']))
                     return None
                     
-            self.log.info('Node Changed > %s > %s' % (self.definitions.nodeChanges[event['action']], event['node']))
+            self.log.info('.. Node Changed > %s > %s' % (self.definitions.nodeChanges[event['action']], event['node']))
             if event['node'] in self.pendingChanges:
                 self.pendingChanges.remove(event['node'])
         except:
@@ -568,14 +570,11 @@ class insteonSubscription(asyncio.Protocol):
       
 class insteonSetter():
     
-    def __init__(self, log, dataset=None):
+    def __init__(self, log, dataset=None, config=None):
+        self.config=config
         self.dataset=dataset
-        self.insteonAddress=self.dataset.config['address']
-        self.port=self.dataset.config['port']
-        self.username=self.dataset.config['user']
-        self.password=self.dataset.config['password']
         self.log=log
-        self.basicauth="Basic %s" % base64.encodebytes(("%s:%s" % (self.username,self.password)).encode('utf-8')).decode()
+        self.basicauth="Basic %s" % base64.encodebytes(("%s:%s" % (self.config.isy_user,self.config.isy_password)).encode('utf-8')).decode()
 
     async def insteonRestCommand(self, client, url):
         
@@ -584,6 +583,7 @@ class insteonSetter():
             data = await client.get(url, headers=headers)
             html = await data.read() 
             return html
+
         except:
             self.log.error("insteonRestCommand failed: %s" % url,exc_info=True)
 
@@ -591,6 +591,7 @@ class insteonSetter():
     async def setNode(self, node, data):
         
         try:
+            set_start=datetime.datetime.now()
             self.log.info('.. Setting node: %s %s' % (node, data))
             if node not in self.dataset.nativeDevices['node']:
                 for alight in self.dataset.nativeDevices['node']:
@@ -601,31 +602,34 @@ class insteonSetter():
             for nodeattrib in data:
                 if nodeattrib.upper() in ['DON','DOF','DFON', 'DFOF']:
                     if nodeattrib.upper() in ['DON', 'DFON'] and data[nodeattrib]:
-                        url="http://%s/rest/nodes/%s/%s/%s/%s" % (self.insteonAddress, node, "cmd", nodeattrib, data[nodeattrib])
+                        url="http://%s/rest/nodes/%s/%s/%s/%s" % (self.config.isy_address, node, "cmd", nodeattrib, data[nodeattrib])
                     else:
-                        url="http://%s/rest/nodes/%s/%s/%s" % (self.insteonAddress, node, "cmd", nodeattrib)
+                        url="http://%s/rest/nodes/%s/%s/%s" % (self.config.isy_address, node, "cmd", nodeattrib)
                 elif nodeattrib.upper()=='ST':
                     if int(data[nodeattrib])==0:
                         control='DOF'
                     else:
                         control='DON'
-                    url="http://%s/rest/nodes/%s/%s/%s/%s" % (self.insteonAddress, node, "cmd", control, data[nodeattrib])
+                    url="http://%s/rest/nodes/%s/%s/%s/%s" % (self.config.isy_address, node, "cmd", control, data[nodeattrib])
                 else:
-                    url="http://%s/rest/nodes/%s/%s/%s/%s" % (self.insteonAddress, node, "set", nodeattrib.upper(), data[nodeattrib])
+                    url="http://%s/rest/nodes/%s/%s/%s/%s" % (self.config.isy_address, node, "set", nodeattrib.upper(), data[nodeattrib])
                 
-                #self.log.info('Using url: %s' % url)
-                async with aiohttp.ClientSession() as client:
-                    html = await self.insteonRestCommand(client, url)
-                    root=et.fromstring(html)
-                    self.log.info('Returned from Using url: %s / %s %s' % (url, html, root))
-                    try:
-                        if root.attrib['succeeded']=='true':
-                            return True
-                    except:
-                        self.log.error('!! error in html response: %s' % html, exc_info=True)
-                    return False
+            #self.log.info('Using url: %s' % url)
+            async with aiohttp.ClientSession() as client:
+                html = await self.insteonRestCommand(client, url)
+                root=et.fromstring(html)
+                self.log.info('.. returned from using url: %s / %s %s' % (url, html, root))
+                try:
+                    if root.attrib['succeeded']=='true':
+                        return True
+                except:
+                    self.log.error('!! error in html response: %s' % html, exc_info=True)
+            return False
+            
+        except concurrent.futures._base.CancelledError:
+            self.log.error('Insteon setNode error (cancelled after %ss): %s %s' % ((datetime.datetime.now()-set_start).total_seconds(), node, data))
         except:
-            self.log.error('Insteon setNode error: %s %s' % (node, data), exc_info=True)
+            self.log.error('Insteon setNode error (after %ss): %s %s' % ((datetime.datetime.now()-set_start).total_seconds(), node, data), exc_info=True)
 
 
     async def setGroup(self, group, data):
@@ -644,9 +648,9 @@ class insteonSetter():
                         control='DOF'
                     else:
                         control='DON'
-                    url="http://%s/rest/nodes/%s/%s/%s/%s" % (self.insteonAddress, group, "cmd", control, data[groupattrib])
+                    url="http://%s/rest/nodes/%s/%s/%s/%s" % (self.config.isy_address, group, "cmd", control, data[groupattrib])
                 else:
-                    url="http://%s/rest/nodes/%s/%s/%s/%s" % (self.insteonAddress, group, "set", groupattrib.upper(), data[groupattrib])
+                    url="http://%s/rest/nodes/%s/%s/%s/%s" % (self.config.isy_address, group, "set", groupattrib.upper(), data[groupattrib])
                 
                 self.log.info('Using url: %s' % url)
                 async with aiohttp.ClientSession() as client:
@@ -659,6 +663,15 @@ class insteonSetter():
 
         
 class insteon(sofabase):
+
+    class adapter_config(configbase):
+    
+        def adapter_fields(self):
+            self.isy_address=self.set_or_default('isy_address', mandatory=True)
+            self.isy_port=self.set_or_default('isy_port', default=80)
+            self.isy_user=self.set_or_default('isy_user', default="admin")
+            self.isy_password=self.set_or_default('isy_password', mandatory=True)
+            self.device_override=self.set_or_default('device_override',default={})
 
     class EndpointHealth(devices.EndpointHealth):
 
@@ -676,9 +689,13 @@ class insteon(sofabase):
 
         async def TurnOn(self, correlationToken='', **kwargs):
             try:
-                tol=100
-                if int((float(self.nativeObject['property']['ST']['value'])/254)*100)>0:
-                    tol=int((float(self.nativeObject['property']['ST']['value'])/254)*100)
+                tol=255
+                #if int((float(self.nativeObject['property']['ST']['value'])/254)*100)>0:
+                #    tol=int((float(self.nativeObject['property']['ST']['value'])/254)*100)
+                try:
+                    tol=int(self.nativeObject['property']['OL']['value'])
+                except:
+                    self.log.error('!. couldnt get onlevel for %s' % self.nativeObject)
                 return await self.adapter.setAndUpdate(self.device, {'DON': tol}, "powerState", "ON", correlationToken, self)
             except:
                 self.adapter.log.error('!! Error during TurnOn', exc_info=True)
@@ -816,23 +833,21 @@ class insteon(sofabase):
 
     class adapterProcess(adapterbase):
 
-        def __init__(self, log=None, dataset=None, notify=None, request=None, loop=None, **kwargs):
+        def __init__(self, log=None, dataset=None, notify=None, request=None, loop=None, config=None, **kwargs):
+            self.config=config
             self.dataset=dataset
-            self.insteonAddress=self.dataset.config['address']
             self.log=log
             self.definitions=definitions.Definitions
             self.notify=notify
-            self.insteonNodes=insteonCatalog(self.log, self.dataset)
-            self.setInsteon=insteonSetter(self.log, dataset=self.dataset)
+            self.insteonNodes=insteonCatalog(self.log, self.dataset, config=self.config)
+            self.setInsteon=insteonSetter(self.log, dataset=self.dataset, config=self.config)
             if not loop:
                 self.loop = asyncio.new_event_loop()
             else:
                 self.loop=loop
             
+        async def pre_activate(self):
             
-        async def start(self):
-            
-            self.log.info('Starting Insteon')
             try:
                 self.insteonNodes.data=self.dataset.nativeDevices
                 self.setInsteon.data=self.dataset.nativeDevices
@@ -840,15 +855,21 @@ class insteon(sofabase):
                 await self.insteonNodes.main()
                 self.log.info('----')
                 
-                self.subscription = insteonSubscription(self.loop, self.log, self.notify, self.dataset)
-                await self.loop.create_connection(lambda: self.subscription, self.insteonAddress, 80)
+                self.subscription = insteonSubscription(self.loop, self.log, self.notify, self.dataset, config=self.config)
+                await self.loop.create_connection(lambda: self.subscription, self.config.isy_address, self.config.isy_port)
             except:
-                self.log.error('Error', exc_info=True)
+                self.log.error('.. pre-activate error', exc_info=True)
+
+
+            
+        async def start(self):
+            
+            self.log.info('Starting Insteon')
+
 
 
         def percentage(self, percent, whole):
             return int((percent * whole) / 100.0)
-
 
 
         async def addSmartDevice(self, path):
@@ -860,7 +881,7 @@ class insteon(sofabase):
             deviceid=path.split("/")[2]    
             nativeObject=self.dataset.getObjectFromPath(self.dataset.getObjectPath(path))
 
-            if nativeObject['name'] not in self.dataset.localDevices:
+            if 'name' in nativeObject and nativeObject['name'] not in self.dataset.localDevices:
                 if 'devicetype' in nativeObject:
                     if nativeObject["devicetype"]=="light":
                         device=devices.alexaDevice('insteon/node/%s' % deviceid, nativeObject['name'], displayCategories=['LIGHT'], adapter=self)
@@ -906,34 +927,100 @@ class insteon(sofabase):
                     return self.dataset.newaddDevice(device)
                     
             return False
+            
+        def compare_native(self, native_device, native_command):
+
+            try:
+                if 'property' not in native_device:
+                    return False
+                device_command = next(iter(native_command.keys()))
+                if device_command in ['DON','DOF','DFON','DFOF']:
+                    device_prop='ST'
+                else:
+                    device_prop=device_command
+                if device_prop in native_device['property']:
+                    if int(native_device['property'][device_prop]['value'])==int(native_command[device_command]):
+                        self.log.info('.. compare_native %s/%s matched %s:%s / %s:%s' % (native_device['name'], native_device['address'], device_prop, native_device['property'][device_prop]['value'], device_command, native_command[device_command]))
+                        return True
+                else:
+                    self.log.info('%s not in %s' % (device_prop, native_device['property']))
+            except:
+                self.log.error('!! error matching native', exc_info=True)
+                
+            #self.log.info('.. compare_native %s/%s no match %s:%s / %s:%s' % (native_device['name'], native_device['address'], device_prop, native_device['property'][device_prop]['value'], device_command, native_command[device_command]))
+            return False
+
 
         async def setAndUpdate(self, device, command, controllerprop, controllervalue, correlationToken, controller):
             
             #  General Set and Update process for insteon. Most direct commands should just set the native command parameters
             #  and then call this to apply the change
             
+            # TODO/Cheese - there is blending of the native properties and Alexa property names that is screwing up the 
+            # overall data and should be reviewed.
+            
             try:
-                if getattr(controller, controllerprop)==controllervalue:
-                    self.log.info('Device already set: %s %s %s=%s' % (controller.controller, controllerprop, getattr(controller, controllerprop), controllervalue))
-                    return device.Response(correlationToken)
-                    
+                groupmembers=[]
                 deviceid=self.dataset.getNativeFromEndpointId(device.endpointId)
-                self.subscription.pendingChanges.append(deviceid)
-                result=await self.setInsteon.setNode(deviceid, command)
-                if result:
-                    self.log.info('Assuming success on response. pre-setting %s to %s' % (controllerprop, controllervalue) )
-                    #await self.dataset.ingest({'node': { deviceid: {'property':updatedProperties}}})
-                    #return device.Response(correlationToken)  
+                if self.compare_native(device.native, command):
+                    self.log.info('.. device already set: %s %s %s=%s' % (controller.controller, controllerprop, getattr(controller, controllerprop), controllervalue))
+                    #await self.dataset.ingest({'node': { deviceid: {'property': { device_prop : { "value" : command[device_command] }}}}})
+                    return device.Response(correlationToken)
+                #self.log.info('command: %s' % command)
+
                 if device.endpointId.startswith('insteon:group:'):
                     groupmembers=await self.group_members(device.endpointId)
                     for member in groupmembers:
-                        self.log.info('.. adding group member to pending: %s' % member)
-                        await self.waitPendingChange(member)                        
-                if not device.endpointId.startswith('insteon:group:'):
-                    self.log.info('Comparing %s vs %s' % (getattr(controller, controllerprop),controllervalue))
+                        short_member=member.split(':')[2]
+                        #if short_member not in self.subscription.pendingChanges:
+                            #self.log.info('.. adding group member to pending: %s' % short_member)
+                            #self.subscription.pendingChanges.append(short_member)
+                else:
+                    if deviceid not in self.subscription.pendingChanges:
+                        self.subscription.pendingChanges.append(deviceid)
+                    
+                        
+                result=await self.setInsteon.setNode(deviceid, command)
+                if result:
+                    self.log.info('.. assuming success on response. pre-setting %s to %s' % (controllerprop, controllervalue) )
+                    updatedProperties={ controllerprop : { "value": controllervalue }}
+                    device_command = next(iter(command.keys()))
+                    # Change direct command to prop
+                    if device_command in ['DON','DOF','DFON','DFOF']:
+                        device_prop='ST'
+                    else:
+                        device_prop=device_command
+                    
+                    # Split out native groups to devices
+                    if device.endpointId.startswith('insteon:group:'):
+                        groupmembers=await self.group_members(device.endpointId)
+                        for member in groupmembers:
+                            short_member=member.split(':')[2]
+                            await self.dataset.ingest({'node': { short_member: {'property': { device_prop : { "value": command[device_command] }}}}})
+                            asyncio.create_task(self.follow_up_on_status(device, command, controllerprop, controllervalue, short_member, controller))
+                    else:
+                        await self.dataset.ingest({'node': { deviceid: {'property': { device_prop : { "value": command[device_command] }}}}})
+                        asyncio.create_task(self.follow_up_on_status(device, command, controllerprop, controllervalue, deviceid, controller))
+                    return device.Response(correlationToken)  
+                    
+                if device.endpointId.startswith('insteon:group:'):
+                    for member in groupmembers:
+                        short_member=member.split(':')[2]
+                        #await self.waitPendingChange(short_member, no_add=True)   
+                        #updatedProperties=await self.insteonNodes.getNodeProperties(short_member)
+                        #await self.dataset.ingest({'node': { short_member: {'property':updatedProperties}}})
+                else:
+                    #self.log.info('Comparing %s vs %s' % (getattr(controller, controllerprop),controllervalue))
                     if getattr(controller, controllerprop)!=controllervalue:
                         await self.waitPendingChange(deviceid)
-                updatedProperties=await self.insteonNodes.getNodeProperties(deviceid)
+                
+                if deviceid in self.subscription.pending_data:
+                    self.log.info('.. getting pending data for %s : %s' % (deviceid, self.subscription.pending_data[deviceid]))
+                    updatedProperties=dict(self.subscription.pending_data[deviceid])
+                    del self.subscription.pending_data[deviceid]
+                else:
+                    self.log.debug('.. no pending change data for %s' % (deviceid))
+                    updatedProperties=await self.insteonNodes.getNodeProperties(deviceid)
                 if not device.endpointId.startswith('insteon:group:'):
                     await self.dataset.ingest({'node': { deviceid: {'property':updatedProperties}}})
                 else:
@@ -943,16 +1030,38 @@ class insteon(sofabase):
                 self.log.error('!! Error during Set and Update: %s %s / %s %s' % (deviceid, command, controllerprop, controllervalue), exc_info=True)
                 return None
 
+        async def follow_up_on_status(self, device, command, controllerprop, controllervalue, deviceid, controller):
+            try:
+                if not device.endpointId.startswith('insteon:group:'):
+                    if getattr(controller, controllerprop)!=controllervalue:
+                        await self.waitPendingChange(deviceid)
+                
+                if deviceid in self.subscription.pending_data:
+                    self.log.info('.. getting pending data for %s : %s' % (deviceid, self.subscription.pending_data[deviceid]))
+                    updatedProperties=dict(self.subscription.pending_data[deviceid])
+                    del self.subscription.pending_data[deviceid]
+                else:
+                    self.log.debug('.. no pending change data for %s' % (deviceid))
+                    updatedProperties=await self.insteonNodes.getNodeProperties(deviceid)
+                if not device.endpointId.startswith('insteon:group:'):
+                    await self.dataset.ingest({'node': { deviceid: {'property':updatedProperties}}})
+                else:
+                    await self.dataset.ingest({'group': { deviceid: {'property':updatedProperties}}})
 
-        async def waitPendingChange(self, deviceid, maxcount=60):
+            except:
+                self.log.error('!! error following up on presumed status: %s %s / %s %s' % (deviceid, command, controllerprop, controllervalue), exc_info=True)
+
+
+        async def waitPendingChange(self, deviceid, maxcount=60, no_add=False):
         
             count=0
             try:
                 # The ISY will send an update to the properties, but it takes .5-1 second to complete
                 # Waiting up to 2 seconds allows us to send back a change report for the change command
-                if deviceid not in self.subscription.pendingChanges:
-                    self.subscription.pendingChanges.append(deviceid)
-                    self.log.info('Waiting for update... %s %s' % (deviceid, self.subscription.pendingChanges))
+                if not no_add:
+                    if deviceid not in self.subscription.pendingChanges:
+                        self.subscription.pendingChanges.append(deviceid)
+                        self.log.info('.. waiting for update... %s %s' % (deviceid, self.subscription.pendingChanges))
                 
                 while deviceid in self.subscription.pendingChanges and count<maxcount:
                     await asyncio.sleep(.1)
@@ -961,13 +1070,13 @@ class insteon(sofabase):
                         self.log.info('!! Timeout waiting for pending changes on %s' % deviceid)
                 return True
             except:
-                self.log.error('Error during wait for pending change for %s (%s)' % (deviceid, count), exc_info=True)
+                self.log.error('!! Error during wait for pending change for %s (%s)' % (deviceid, count), exc_info=True)
                 return True
                 
         async def group_members(self, endpointId):
             try:
                 groupmembers=[]
-                self.log.info('.. getting group members for %s' % endpointId)
+                #self.log.debug('.. getting group members for %s' % endpointId)
                 for link in self.dataset.nativeDevices['group'][endpointId.split(':',2)[2]]['members']['link']:
                     groupmembers.append('insteon:node:%s' % link['#text'])
             except:
@@ -987,7 +1096,7 @@ class insteon(sofabase):
                         if all_controllers:
                             groupmembers=await self.group_members("insteon:group:%s" % group)
                             if Counter(devicelist) == Counter(groupmembers):  
-                                return { "id": "insteon:group:%s" % group, "name": self.dataset.nativeDevices['group'][group]['name'] }
+                                return { "id": "insteon:group:%s" % group, "name": self.dataset.nativeDevices['group'][group]['name'], "members": groupmembers }
                             
                 #self.log.info('.. no virtual group found for %s' % devicelist)
             except:
