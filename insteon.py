@@ -880,8 +880,12 @@ class insteon(sofabase):
             
             deviceid=path.split("/")[2]    
             nativeObject=self.dataset.getObjectFromPath(self.dataset.getObjectPath(path))
-
-            if 'name' in nativeObject and nativeObject['name'] not in self.dataset.localDevices:
+            if 'deviceGroup' in nativeObject:
+                endpointId="%s:%s:%s" % ("insteon","group", deviceid)
+            else:
+                endpointId="%s:%s:%s" % ("insteon","node", deviceid)
+            
+            if 'name' in nativeObject and endpointId not in self.dataset.localDevices:
                 if 'devicetype' in nativeObject:
                     if nativeObject["devicetype"]=="light":
                         device=devices.alexaDevice('insteon/node/%s' % deviceid, nativeObject['name'], displayCategories=['LIGHT'], adapter=self)
@@ -890,7 +894,7 @@ class insteon(sofabase):
                         device.StateController=devices.StateController(device=device)
                         if nativeObject["property"]["ST"]["uom"].find("%")>-1:
                             device.BrightnessController=insteon.BrightnessController(device=device)
-                        return self.dataset.newaddDevice(device)
+                        return self.dataset.add_device(device)
     
                     elif nativeObject["devicetype"]=="lightswitch":
                         device=devices.alexaDevice('insteon/node/%s' % deviceid, nativeObject['name'], displayCategories=['LIGHT'], adapter=self)
@@ -900,31 +904,31 @@ class insteon(sofabase):
                         device.SwitchController=insteon.SwitchController(device=device)
                         if nativeObject["property"]["ST"]["uom"].find("%")>-1:
                             device.BrightnessController=insteon.BrightnessController(device=device)
-                        return self.dataset.newaddDevice(device)
+                        return self.dataset.add_device(device)
     
                     elif nativeObject["devicetype"]=="button":
                         device=devices.alexaDevice('insteon/node/%s' % deviceid, nativeObject['name'], displayCategories=['SWITCH'], adapter=self)
                         device.SwitchController=insteon.SwitchController(device=device)
-                        return self.dataset.newaddDevice(device)
+                        return self.dataset.add_device(device)
     
                     elif nativeObject["devicetype"]=="thermostat":
                         if nativeObject['pnode']==deviceid:
                             device=devices.alexaDevice('insteon/node/%s' % deviceid, nativeObject['name'], displayCategories=['THERMOSTAT'], adapter=self)
                             device.ThermostatController=insteon.ThermostatController(device=device)
                             device.TemperatureSensor=insteon.TemperatureSensor(device=device)
-                            return self.dataset.newaddDevice(device)
+                            return self.dataset.add_device(device)
     
                     elif nativeObject["devicetype"]=="device":
                         device=devices.alexaDevice('insteon/node/%s' % deviceid, nativeObject['name'], displayCategories=['SWITCH'], adapter=self)
                         device.PowerController=insteon.PowerController(device=device)
-                        return self.dataset.newaddDevice(device)
+                        return self.dataset.add_device(device)
                     
                 elif 'deviceGroup' in nativeObject:
                     device=devices.alexaDevice('insteon/group/%s' % deviceid, nativeObject['name'], displayCategories=['GROUP'], adapter=self, hidden=True)
                     device.EndpointHealth=insteon.EndpointHealth(device=device)    
                     device.PowerController=insteon.GroupPowerController(device=device)
                     #device.BrightnessController=insteon.GroupBrightnessController(device=device)
-                    return self.dataset.newaddDevice(device)
+                    return self.dataset.add_device(device)
                     
             return False
             
